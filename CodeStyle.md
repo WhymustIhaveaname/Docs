@@ -10,8 +10,8 @@
 ### No Defensive Programming
 - Avoid unnecessary safety checks and validations
 - Let code fail fast when preconditions are not met. Let exceptions bubble up naturally when appropriate
-- Use try-catch blocks sparingly, only when absolutely necessary
-- **NEVER** use `dict.get()` with default values - use direct dictionary access: `config['key']`
+- Do NOT use try-catch. If you think it's absolutely necessary, ask the user first and only proceed with user approval
+- **NEVER** use `dict.get()` with default values - use direct dictionary access: `config['key']`. If you think `dict.get()` is necessary, ask the user first and only proceed with user approval
 
 ### Self-Documenting Code Over Comments
 - **Good code doesn't need comments** - if control flow is clear and variables are well-named, the code should be self-explanatory

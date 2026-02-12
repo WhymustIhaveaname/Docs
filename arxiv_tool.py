@@ -14,12 +14,17 @@ arXiv 论文搜索与全文获取工具
 功能：
 1. search - 搜索论文（关键词、标题、摘要）
 2. fetch - 获取论文全文（PDF 和 txt 都保留）
-3. cited - 被引反查（Semantic Scholar 首选，OpenAlex 备选）
+3. info - 获取论文信息（标题、作者、摘要等，不下载）
+4. bib - 生成 BibTeX 引用（自动生成 citation key）
+5. tex - 下载 LaTeX 源文件并解压
+6. cited - 被引反查（Semantic Scholar 首选，OpenAlex 备选）
 
 使用方法（通过 uv run）：
     uv run /home/prime/Codes/Docs/arxiv_tool.py search "PINN" --max 5
     uv run /home/prime/Codes/Docs/arxiv_tool.py fetch 2401.12345
-    uv run /home/prime/Codes/Docs/arxiv_tool.py fetch 2401.12345 2401.12346  # 批量
+    uv run /home/prime/Codes/Docs/arxiv_tool.py info 2401.12345
+    uv run /home/prime/Codes/Docs/arxiv_tool.py bib 2401.12345 -o refs.bib
+    uv run /home/prime/Codes/Docs/arxiv_tool.py tex 2401.12345
     uv run /home/prime/Codes/Docs/arxiv_tool.py cited 1711.10561 --max 20
     uv run /home/prime/Codes/Docs/arxiv_tool.py cited 1711.10561 --offset 20  # 翻页
     uv run /home/prime/Codes/Docs/arxiv_tool.py cited 1711.10561 --source openalex
@@ -32,6 +37,7 @@ import gzip
 import io
 import os
 import re
+import shutil
 import sys
 import tarfile
 import time
@@ -59,7 +65,6 @@ HTTP_HEADERS = {
     "User-Agent": "arxiv-tool/1.0 (mailto:syouran0508@gmail.com)",
 }
 
-# 输出目录
 OUTPUT_DIR = SCRIPT_DIR / "arxiv"
 
 
@@ -100,8 +105,6 @@ def get_paper_info(arxiv_id: str, retries: int = 3) -> Result | None:
 
 
 def sanitize_filename(name: str, max_length: int = 80) -> str:
-    """清理文件名，移除非法字符"""
-    # 移除或替换非法字符
     name = re.sub(r'[<>:"/\\|?*]', "", name)
     name = re.sub(r"\s+", "_", name)
     name = name.strip("._")
@@ -119,7 +122,6 @@ def extract_arxiv_id(input_str: str) -> str:
     - https://arxiv.org/abs/2401.12345
     - https://arxiv.org/pdf/2401.12345.pdf
     """
-    # 匹配 arXiv ID 模式
     patterns = [
         r"(\d{4}\.\d{4,5}(?:v\d+)?)",  # 新格式: 2401.12345 或 2401.12345v1
         r"([a-z-]+/\d{7})",  # 旧格式: cs/0401001
@@ -132,7 +134,6 @@ def extract_arxiv_id(input_str: str) -> str:
 
 
 def extract_text_from_pdf(pdf_path: Path) -> str:
-    """使用 PyMuPDF 从 PDF 提取文本"""
     doc = fitz.open(pdf_path)
     text_parts = []
     for page in doc:
@@ -142,7 +143,6 @@ def extract_text_from_pdf(pdf_path: Path) -> str:
 
 
 def download_pdf(url: str, save_path: Path) -> bool:
-    """下载 PDF 文件"""
     try:
         response = requests.get(url, headers=HTTP_HEADERS, timeout=60)
         response.raise_for_status()
@@ -167,19 +167,17 @@ def search_papers(
         sort_by: 排序方式 (relevance, submitted, updated)
         categories: arXiv 分类列表，如 ["cs.AI", "cs.LG"]
     """
-    # 构建查询
     search_query = query
     if categories:
         cat_query = " OR ".join(f"cat:{cat}" for cat in categories)
         search_query = f"({query}) AND ({cat_query})"
 
-    # 排序方式
     sort_map = {
         "relevance": arxiv.SortCriterion.Relevance,
         "submitted": arxiv.SortCriterion.SubmittedDate,
         "updated": arxiv.SortCriterion.LastUpdatedDate,
     }
-    sort_criterion = sort_map.get(sort_by, arxiv.SortCriterion.Relevance)
+    sort_criterion = sort_map[sort_by]
 
     client = arxiv.Client()
     search = arxiv.Search(
@@ -210,23 +208,19 @@ def fetch_paper(arxiv_id: str, output_dir: Path) -> Path | None:
     txt_file = output_dir / f"{file_id}.txt"
     pdf_file = output_dir / f"{file_id}.pdf"
 
-    # 检查是否已存在（txt 已有则跳过）
     if txt_file.exists():
         print(f"文件已存在: {txt_file}")
         return txt_file
 
-    # 直接下载 PDF（保存到输出目录）
     pdf_url = f"https://arxiv.org/pdf/{clean_id}"
     print(f"下载 PDF: {pdf_url}")
 
     if not download_pdf(pdf_url, pdf_file):
         return None
 
-    # 提取文本
     print("提取文本...")
     text = extract_text_from_pdf(pdf_file)
 
-    # 简单元数据头（无需 API）
     header = f"""\
 # arXiv:{clean_id}
 
@@ -236,7 +230,6 @@ URL: https://arxiv.org/abs/{clean_id}
 
 """
 
-    # 保存 txt
     txt_file.write_text(header + text, encoding="utf-8")
     print(f"已保存 PDF: {pdf_file}")
     print(f"已保存 TXT: {txt_file}")
@@ -244,7 +237,6 @@ URL: https://arxiv.org/abs/{clean_id}
 
 
 def cmd_search(args):
-    """搜索命令"""
     categories = args.categories.split(",") if args.categories else None
 
     results = search_papers(
@@ -261,7 +253,6 @@ def cmd_search(args):
     print(f"\n找到 {len(results)} 篇论文:\n")
 
     for i, paper in enumerate(results, 1):
-        # 提取 arXiv ID
         arxiv_id = paper.entry_id.split("/abs/")[-1]
 
         print(f"[{i}] {arxiv_id}")
@@ -270,30 +261,18 @@ def cmd_search(args):
         print(f"    日期: {paper.published.strftime('%Y-%m-%d')}")
         print(f"    分类: {', '.join(paper.categories[:3])}")
 
-        # 摘要截断
-        abstract = paper.summary.replace("\n", " ")
-        if len(abstract) > 200:
-            abstract = abstract[:200] + "..."
-        print(f"    摘要: {abstract}")
+        print(f"    摘要: {paper.summary.replace(chr(10), ' ')}")
         print()
 
 
 def cmd_fetch(args):
-    """获取全文命令"""
     output_dir = Path(args.output) if args.output else OUTPUT_DIR
-
-    success = 0
-    for arxiv_id in args.arxiv_ids:
-        result = fetch_paper(arxiv_id, output_dir)
-        if result:
-            success += 1
-        print()
-
-    print(f"完成: {success}/{len(args.arxiv_ids)} 篇论文")
+    result = fetch_paper(args.arxiv_id, output_dir)
+    if not result:
+        sys.exit(1)
 
 
 def cmd_info(args):
-    """获取论文信息（不下载全文）"""
     clean_id = extract_arxiv_id(args.arxiv_id)
 
     paper = get_paper_info(clean_id)
@@ -326,20 +305,10 @@ def generate_citation_key(paper: Result) -> str:
     格式：{第一作者姓小写}{年份}{标题首个实词小写}
     示例：li2025codepde, raissi2017physics
     """
-    # 提取第一作者姓氏
-    first_author = paper.authors[0].name if paper.authors else "unknown"
-    # 姓氏通常是最后一个词
-    last_name = first_author.split()[-1].lower()
-    # 移除非字母字符
-    last_name = re.sub(r"[^a-z]", "", last_name)
-
-    # 年份
+    last_name = re.sub(r"[^a-z]", "", paper.authors[0].name.split()[-1].lower())
     year = paper.published.year
 
-    # 标题首个实词
-    title = paper.title
-    # 移除标题中的特殊字符和数字
-    title_words = re.findall(r"[a-zA-Z]+", title)
+    title_words = re.findall(r"[a-zA-Z]+", paper.title)
     first_word = ""
     for word in title_words:
         if word.lower() not in STOPWORDS:
@@ -352,69 +321,44 @@ def generate_citation_key(paper: Result) -> str:
 def generate_bibtex(paper: Result, arxiv_id: str) -> str:
     """生成 arXiv 标准格式的 BibTeX 条目"""
     citation_key = generate_citation_key(paper)
-
-    # 作者列表，用 " and " 连接
     authors = " and ".join(a.name for a in paper.authors)
-
-    # 年份
-    year = paper.published.year
-
-    # 主分类
-    primary_class = paper.categories[0] if paper.categories else ""
-
-    # 清理 arXiv ID（移除版本号）
     clean_id = re.sub(r"v\d+$", "", arxiv_id)
 
-    # 生成 BibTeX
     bibtex = f"""@misc{{{citation_key},
       title={{{paper.title}}},
       author={{{authors}}},
-      year={{{year}}},
+      year={{{paper.published.year}}},
       eprint={{{clean_id}}},
       archivePrefix={{arXiv}},
-      primaryClass={{{primary_class}}},
+      primaryClass={{{paper.categories[0]}}},
       url={{https://arxiv.org/abs/{clean_id}}},
 }}"""
     return bibtex
 
 
 def cmd_bib(args):
-    """生成 BibTeX 引用"""
-    bibtex_entries = []
+    clean_id = extract_arxiv_id(args.arxiv_id)
 
-    for arxiv_id in args.arxiv_ids:
-        clean_id = extract_arxiv_id(arxiv_id)
+    paper = get_paper_info(clean_id)
+    if not paper:
+        sys.exit(1)
 
-        paper = get_paper_info(clean_id)
-        if not paper:
-            continue
-
-        bibtex = generate_bibtex(paper, clean_id)
-        bibtex_entries.append(bibtex)
-
-    if not bibtex_entries:
-        return
-
-    output = "\n\n".join(bibtex_entries)
+    bibtex = generate_bibtex(paper, clean_id)
 
     if args.output:
-        # 追加写入文件
         output_path = Path(args.output)
         mode = "a" if output_path.exists() else "w"
         with open(output_path, mode, encoding="utf-8") as f:
             if mode == "a" and output_path.stat().st_size > 0:
                 f.write("\n\n")
-            f.write(output)
+            f.write(bibtex)
             f.write("\n")
         print(f"已{'追加' if mode == 'a' else '写入'}到: {output_path}")
-        print(f"共 {len(bibtex_entries)} 条引用")
     else:
-        # 输出到终端
-        print(output)
+        print(bibtex)
 
 
 def print_tree(directory: Path, prefix: str = "", max_depth: int = 3, current_depth: int = 0) -> list[str]:
-    """生成目录树结构"""
     lines = []
     if current_depth >= max_depth:
         return lines
@@ -452,16 +396,14 @@ def fetch_tex_source(arxiv_id: str, output_dir: Path) -> Path | None:
     dir_id = re.sub(r"v\d+$", "", clean_id).replace("/", "_")
     target_dir = output_dir / dir_id
 
-    # 检查是否已存在（也检查带标题后缀的目录）
     if target_dir.exists():
         print(f"目录已存在: {target_dir}")
         return target_dir
-    existing = list(output_dir.glob(f"{dir_id}_*"))
+    existing = [p for p in output_dir.glob(f"{dir_id}_*") if p.is_dir()]
     if existing:
         print(f"目录已存在: {existing[0]}")
         return existing[0]
 
-    # 直接下载源文件（不调 API）
     source_url = f"https://arxiv.org/e-print/{clean_id}"
     print(f"下载源文件: {source_url}")
 
@@ -474,20 +416,15 @@ def fetch_tex_source(arxiv_id: str, output_dir: Path) -> Path | None:
 
     content = response.content
 
-    # 创建目标目录
     target_dir.mkdir(parents=True, exist_ok=True)
-
-    # 尝试解压
     print("解压源文件...")
     try:
         _extract_source(content, target_dir)
     except Exception as e:
         print(f"解压失败: {e}", file=sys.stderr)
-        import shutil
         shutil.rmtree(target_dir, ignore_errors=True)
         return None
 
-    # 尝试从 tex 文件提取标题来重命名目录（免费操作，不需要网络）
     new_dir = _try_rename_with_title(target_dir, dir_id, output_dir)
     if new_dir:
         target_dir = new_dir
@@ -497,8 +434,6 @@ def fetch_tex_source(arxiv_id: str, output_dir: Path) -> Path | None:
 
 
 def _extract_source(content: bytes, target_dir: Path) -> None:
-    """尝试多种格式解压 arXiv 源文件"""
-    # 尝试作为 tar.gz 解压
     try:
         with tarfile.open(fileobj=io.BytesIO(content), mode="r:gz") as tar:
             tar.extractall(target_dir, filter="data")
@@ -507,7 +442,6 @@ def _extract_source(content: bytes, target_dir: Path) -> None:
     except tarfile.ReadError:
         pass
 
-    # 尝试作为纯 gzip 解压
     try:
         decompressed = gzip.decompress(content)
         # 解压后可能是 tar
@@ -525,7 +459,6 @@ def _extract_source(content: bytes, target_dir: Path) -> None:
     except gzip.BadGzipFile:
         pass
 
-    # 可能是未压缩的 tar
     try:
         with tarfile.open(fileobj=io.BytesIO(content), mode="r") as tar:
             tar.extractall(target_dir, filter="data")
@@ -534,29 +467,23 @@ def _extract_source(content: bytes, target_dir: Path) -> None:
     except tarfile.ReadError:
         pass
 
-    # 可能是纯文本 .tex 文件
     tex_file = target_dir / "main.tex"
     tex_file.write_bytes(content)
     print("保存为单个 tex 文件（无压缩）")
 
 
 def _try_rename_with_title(target_dir: Path, dir_id: str, output_dir: Path) -> Path | None:
-    """尝试从 tex 文件中提取标题，用于重命名目录"""
-    # 找到主 tex 文件
     tex_files = list(target_dir.glob("*.tex"))
     if not tex_files:
         return None
 
-    # 优先 main.tex，否则取第一个
     main_tex = next((f for f in tex_files if f.name == "main.tex"), tex_files[0])
 
     try:
         content = main_tex.read_text(encoding="utf-8", errors="ignore")
-        # 匹配 \title{...}（支持多行）
         match = re.search(r"\\title\s*\{([^}]+)\}", content, re.DOTALL)
         if match:
             raw_title = match.group(1).strip()
-            # 清理 LaTeX 命令
             raw_title = re.sub(r"\\[a-zA-Z]+\s*", " ", raw_title)
             raw_title = re.sub(r"[{}]", "", raw_title)
             raw_title = re.sub(r"\s+", " ", raw_title).strip()
@@ -574,17 +501,12 @@ def _try_rename_with_title(target_dir: Path, dir_id: str, output_dir: Path) -> P
     return None
 
 
-# ────────────────────────────────────────────────────────────────────
-# 被引反查（Semantic Scholar + OpenAlex fallback）
-# ────────────────────────────────────────────────────────────────────
-
 S2_API_BASE = "https://api.semanticscholar.org/graph/v1"
 OPENALEX_API_BASE = "https://api.openalex.org"
 CONTACT_EMAIL = "syouran0508@gmail.com"
 
 
 def _s2_headers() -> dict[str, str]:
-    """Semantic Scholar 请求头（有 key 就带上）"""
     headers = dict(HTTP_HEADERS)
     if S2_API_KEY:
         headers["x-api-key"] = S2_API_KEY
@@ -597,7 +519,6 @@ def _fetch_citations_s2(arxiv_id: str, max_results: int, offset: int = 0) -> tup
     Returns:
         (引用论文列表, 总被引次数)，失败返回 None
     """
-    # 先获取论文基本信息（含总被引数）
     info_url = f"{S2_API_BASE}/paper/ArXiv:{arxiv_id}"
     try:
         resp = requests.get(
@@ -608,15 +529,12 @@ def _fetch_citations_s2(arxiv_id: str, max_results: int, offset: int = 0) -> tup
         )
         resp.raise_for_status()
         paper_info = resp.json()
-        total_citations = paper_info.get("citationCount", 0)
-        paper_title = paper_info.get("title", "")
-        print(f"论文: {paper_title}")
-        print(f"总被引次数: {total_citations}")
+        print(f"论文: {paper_info['title']}")
+        print(f"总被引次数: {paper_info['citationCount']}")
     except requests.RequestException as e:
         print(f"Semantic Scholar 查询失败: {e}", file=sys.stderr)
         return None
 
-    # 获取引用列表
     citations_url = f"{S2_API_BASE}/paper/ArXiv:{arxiv_id}/citations"
     try:
         resp = requests.get(
@@ -635,17 +553,11 @@ def _fetch_citations_s2(arxiv_id: str, max_results: int, offset: int = 0) -> tup
         print(f"Semantic Scholar 引用列表获取失败: {e}", file=sys.stderr)
         return None
 
-    results = []
-    for item in data.get("data", []):
-        paper = item.get("citingPaper", {})
-        if paper.get("title"):
-            results.append(paper)
-
-    return results[:max_results], total_citations
+    results = [item["citingPaper"] for item in data["data"] if item["citingPaper"]["title"]]
+    return results[:max_results], paper_info["citationCount"]
 
 
 def _openalex_params(**extra) -> dict[str, str]:
-    """OpenAlex 请求参数（有 key 用 key，否则用 mailto）"""
     params = dict(extra)
     if OPENALEX_API_KEY:
         params["api_key"] = OPENALEX_API_KEY
@@ -666,10 +578,8 @@ def _resolve_openalex_id(arxiv_id: str) -> tuple[str, str, int] | None:
         resp = requests.get(url, params=_openalex_params(), timeout=15)
         resp.raise_for_status()
         data = resp.json()
-        openalex_id = data.get("id", "").split("/")[-1]  # "https://openalex.org/W123" -> "W123"
-        title = data.get("title", "")
-        cited_by = data.get("cited_by_count", 0)
-        return openalex_id, title, cited_by
+        openalex_id = data["id"].split("/")[-1]  # "https://openalex.org/W123" -> "W123"
+        return openalex_id, data["title"], data["cited_by_count"]
     except requests.RequestException:
         return None
 
@@ -712,50 +622,40 @@ def _fetch_citations_openalex(arxiv_id: str, max_results: int, offset: int = 0) 
         print(f"OpenAlex 引用列表获取失败: {e}", file=sys.stderr)
         return None
 
-    return data.get("results", [])[:max_results], total_citations
+    return data["results"][:max_results], total_citations
 
 
 def _print_citations_s2(results: list[dict], start: int = 1) -> None:
-    """打印 Semantic Scholar 格式的引用列表"""
     for i, paper in enumerate(results, start):
-        ext_ids = paper.get("externalIds") or {}
-        arxiv_ext = ext_ids.get("ArXiv", "")
+        ext_ids = paper["externalIds"] or {}
+        arxiv_ext = ext_ids.get("ArXiv")
         arxiv_str = f"  arXiv:{arxiv_ext}" if arxiv_ext else ""
 
-        authors = paper.get("authors") or []
-        author_str = ", ".join(a.get("name", "") for a in authors[:3])
+        authors = paper["authors"] or []
+        author_str = ", ".join(a["name"] for a in authors[:3])
         if len(authors) > 3:
             author_str += "..."
 
-        cite_count = paper.get("citationCount", 0)
-        year = paper.get("year") or "?"
-
-        print(f"[{i}] {paper.get('title', '无标题')}")
+        print(f"[{i}] {paper['title']}")
         print(f"    作者: {author_str}")
-        print(f"    年份: {year}  被引: {cite_count}{arxiv_str}")
+        print(f"    年份: {paper['year'] or '?'}  被引: {paper['citationCount']}{arxiv_str}")
         print()
 
 
 def _print_citations_openalex(results: list[dict], start: int = 1) -> None:
-    """打印 OpenAlex 格式的引用列表"""
     for i, work in enumerate(results, start):
-        authorships = work.get("authorships") or []
-        author_names = [a.get("author", {}).get("display_name", "") for a in authorships[:3]]
-        author_str = ", ".join(n for n in author_names if n)
+        authorships = work["authorships"] or []
+        author_str = ", ".join(a["author"]["display_name"] for a in authorships[:3])
         if len(authorships) > 3:
             author_str += "..."
 
-        cite_count = work.get("cited_by_count", 0)
-        year = work.get("publication_year") or "?"
-
-        print(f"[{i}] {work.get('title', '无标题')}")
+        print(f"[{i}] {work['title']}")
         print(f"    作者: {author_str}")
-        print(f"    年份: {year}  被引: {cite_count}")
+        print(f"    年份: {work['publication_year'] or '?'}  被引: {work['cited_by_count']}")
         print()
 
 
 def cmd_cited(args):
-    """被引反查命令"""
     clean_id = extract_arxiv_id(args.arxiv_id)
     source = args.source
     offset = args.offset
@@ -795,23 +695,16 @@ def cmd_cited(args):
 
 
 def cmd_tex(args):
-    """下载 LaTeX 源文件命令"""
     output_dir = Path(args.output) if args.output else OUTPUT_DIR
-
-    success = 0
-    for arxiv_id in args.arxiv_ids:
-        result = fetch_tex_source(arxiv_id, output_dir)
-        if result:
-            success += 1
-            # 打印目录树
-            print(f"\n目录结构:")
-            print(result.name)
-            tree_lines = print_tree(result)
-            for line in tree_lines:
-                print(line)
-        print()
-
-    print(f"完成: {success}/{len(args.arxiv_ids)} 篇论文")
+    result = fetch_tex_source(args.arxiv_id, output_dir)
+    if result:
+        print("\n目录结构:")
+        print(result.name)
+        tree_lines = print_tree(result)
+        for line in tree_lines:
+            print(line)
+    else:
+        sys.exit(1)
 
 
 def main():
@@ -823,10 +716,10 @@ def main():
     %(prog)s search "PINN" --max 5
     %(prog)s search "physics-informed" --categories cs.LG,physics.comp-ph
     %(prog)s fetch 2401.12345
-    %(prog)s fetch 2401.12345 2401.12346 --output ./papers
+    %(prog)s fetch 2401.12345 --output ./papers
     %(prog)s info 2401.12345
     %(prog)s bib 2505.08783
-    %(prog)s bib 2505.08783 2511.07262 -o references.bib
+    %(prog)s bib 2505.08783 -o references.bib
     %(prog)s tex 2505.08783
     %(prog)s cited 1711.10561
     %(prog)s cited 1711.10561 --max 50
@@ -852,7 +745,7 @@ def main():
 
     # fetch 子命令
     fetch_parser = subparsers.add_parser("fetch", help="获取论文全文并保存为 txt")
-    fetch_parser.add_argument("arxiv_ids", nargs="+", help="arXiv ID (支持多个)")
+    fetch_parser.add_argument("arxiv_id", help="arXiv ID")
     fetch_parser.add_argument("--output", "-o", help=f"输出目录 (默认 {OUTPUT_DIR})")
     fetch_parser.set_defaults(func=cmd_fetch)
 
@@ -863,7 +756,7 @@ def main():
 
     # bib 子命令
     bib_parser = subparsers.add_parser("bib", help="生成 BibTeX 引用")
-    bib_parser.add_argument("arxiv_ids", nargs="+", help="arXiv ID (支持多个)")
+    bib_parser.add_argument("arxiv_id", help="arXiv ID")
     bib_parser.add_argument("--output", "-o", help="输出文件路径（追加写入）")
     bib_parser.set_defaults(func=cmd_bib)
 
@@ -882,7 +775,7 @@ def main():
 
     # tex 子命令
     tex_parser = subparsers.add_parser("tex", help="下载 LaTeX 源文件并解压")
-    tex_parser.add_argument("arxiv_ids", nargs="+", help="arXiv ID (支持多个)")
+    tex_parser.add_argument("arxiv_id", help="arXiv ID")
     tex_parser.add_argument("--output", "-o", help=f"输出目录 (默认 {OUTPUT_DIR})")
     tex_parser.set_defaults(func=cmd_tex)
 

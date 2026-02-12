@@ -7,17 +7,6 @@ description: 搜索和分析 arXiv 论文。当用户需要查找学术论文、
 
 此技能用于搜索、下载和分析 arXiv 上的学术论文。
 
-## 工具
-
-有两个工具可用：
-
-| 工具 | 功能 |
-|------|------|
-| arxiv_tool.py | 搜索论文、获取**全文** txt（推荐）|
-| arxiv-search | 搜索论文、获取元数据/摘要（仅 JSON）|
-
-**推荐**：需要全文时用 `arxiv_tool.py`，只需元数据时用 `arxiv-search`。
-
 ## 使用时机
 
 - 用户需要搜索 arXiv 论文
@@ -28,9 +17,17 @@ description: 搜索和分析 arXiv 论文。当用户需要查找学术论文、
 
 ---
 
-## 工具 1: arxiv_tool.py（推荐）
+**运行方式**：Docs 下有 `.venv`，直接用：
 
-Python 脚本，支持搜索和获取全文。**使用 uv run 运行**（自动处理依赖）。
+```bash
+/home/prime/Codes/Docs/.venv/bin/python /home/prime/Codes/Docs/arxiv_tool.py <子命令>
+```
+
+也可以用 `uv run`（会自动识别 `.venv`，不重复安装）：
+
+```bash
+uv run /home/prime/Codes/Docs/arxiv_tool.py <子命令>
+```
 
 ### 搜索论文
 
@@ -49,7 +46,6 @@ uv run /home/prime/Codes/Docs/arxiv_tool.py search "neural network" --sort relev
 
 ```bash
 uv run /home/prime/Codes/Docs/arxiv_tool.py fetch 2401.12345
-uv run /home/prime/Codes/Docs/arxiv_tool.py fetch 2401.12345 2402.67890  # 批量
 uv run /home/prime/Codes/Docs/arxiv_tool.py fetch 2401.12345 -o ./my_papers
 ```
 
@@ -68,7 +64,6 @@ uv run /home/prime/Codes/Docs/arxiv_tool.py info 2401.12345
 
 ```bash
 uv run /home/prime/Codes/Docs/arxiv_tool.py bib 2505.08783
-uv run /home/prime/Codes/Docs/arxiv_tool.py bib 2505.08783 2511.07262  # 多篇
 uv run /home/prime/Codes/Docs/arxiv_tool.py bib 2505.08783 -o references.bib  # 追加到文件
 ```
 
@@ -80,7 +75,6 @@ uv run /home/prime/Codes/Docs/arxiv_tool.py bib 2505.08783 -o references.bib  # 
 
 ```bash
 uv run /home/prime/Codes/Docs/arxiv_tool.py tex 2505.08783
-uv run /home/prime/Codes/Docs/arxiv_tool.py tex 2505.08783 2511.07262  # 多篇
 ```
 
 - 下载 arXiv 源文件（tar.gz/gzip）并自动解压
@@ -109,26 +103,6 @@ uv run /home/prime/Codes/Docs/arxiv_tool.py cited 1711.10561 --source s2        
 
 ---
 
-## 工具 2: arxiv-search（仅元数据）
-
-来自 `arxiv-mcp-server`，返回 JSON 格式。
-
-### 搜索
-
-```bash
-/home/prime/Docs/.venv/bin/arxiv-search search "关键词" --max-results 5 --categories cs.LG
-```
-
-### 获取元数据
-
-```bash
-/home/prime/Docs/.venv/bin/arxiv-search analyze 2401.12345
-```
-
-**注意**：`analyze` 只返回元数据和摘要，**不包含正文**。
-
----
-
 ## 常用 arXiv 分类
 
 | 分类 | 领域 |
@@ -152,11 +126,22 @@ uv run /home/prime/Codes/Docs/arxiv_tool.py cited 1711.10561 --source s2        
 | 已知 arXiv ID，只需摘要 | `arxiv_tool.py info <ID>` |
 | 搜索某领域论文 | `arxiv_tool.py search "关键词"` |
 | 生成 BibTeX 引用 | `arxiv_tool.py bib <ID>` |
-| 批量生成引用到文件 | `arxiv_tool.py bib <ID1> <ID2> -o refs.bib` |
+| 生成引用到文件 | `arxiv_tool.py bib <ID> -o refs.bib` |
 | 查看哪些论文引用了它 | `arxiv_tool.py cited <ID>` |
 | 查看被引（翻页） | `arxiv_tool.py cited <ID> --offset 20` |
 | 非 arXiv 论文 | 此工具不适用，用 curl 获取网页或让用户提供摘要 |
 
+## 配置
+
+API Key 存放在 `Docs/.env`（已 gitignore），脚本启动时自动加载：
+
+```
+S2_API_KEY=xxx         # Semantic Scholar（被引反查用）
+OPENALEX_API_KEY=xxx   # OpenAlex（被引反查备选）
+```
+
+有 key 就用，没有也不影响基本功能（search/fetch/info/bib/tex 不需要 key）。
+
 ## 输出目录
 
-全文 txt 保存位置: `/home/prime/Codes/Docs/arxiv/`
+全文 txt 和 PDF 保存位置: `/home/prime/Codes/Docs/arxiv/`
