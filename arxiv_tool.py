@@ -472,6 +472,31 @@ def _extract_source(content: bytes, target_dir: Path) -> None:
     print("保存为单个 tex 文件（无压缩）")
 
 
+def _extract_braced_arg(text: str, start: int) -> str | None:
+    """提取 text[start] 处 '{' 对应的完整花括号内容，支持嵌套"""
+    if start >= len(text) or text[start] != "{":
+        return None
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start + 1 : i]
+    return None
+
+
+def _strip_tex_comments(content: str) -> str:
+    """移除 TeX 注释（% 开头的整行，以及行内未转义的 %）"""
+    result = []
+    for line in content.split("\n"):
+        if line.lstrip().startswith("%"):
+            continue
+        result.append(re.sub(r"(?<!\\)%.*$", "", line))
+    return "\n".join(result)
+
+
 def _try_rename_with_title(target_dir: Path, dir_id: str, output_dir: Path) -> Path | None:
     tex_files = list(target_dir.glob("*.tex"))
     if not tex_files:
@@ -479,26 +504,31 @@ def _try_rename_with_title(target_dir: Path, dir_id: str, output_dir: Path) -> P
 
     main_tex = next((f for f in tex_files if f.name == "main.tex"), tex_files[0])
 
-    try:
-        content = main_tex.read_text(encoding="utf-8", errors="ignore")
-        match = re.search(r"\\title\s*\{([^}]+)\}", content, re.DOTALL)
-        if match:
-            raw_title = match.group(1).strip()
-            raw_title = re.sub(r"\\[a-zA-Z]+\s*", " ", raw_title)
-            raw_title = re.sub(r"[{}]", "", raw_title)
-            raw_title = re.sub(r"\s+", " ", raw_title).strip()
+    content = main_tex.read_text(encoding="utf-8", errors="ignore")
+    content = _strip_tex_comments(content)
+    match = re.search(r"\\title\s*\{", content)
+    if not match:
+        return None
 
-            if raw_title:
-                safe_title = sanitize_filename(raw_title, max_length=40)
-                new_dir = output_dir / f"{dir_id}_{safe_title}"
-                if not new_dir.exists():
-                    target_dir.rename(new_dir)
-                    print(f"从 tex 提取标题，目录重命名为: {new_dir.name}")
-                    return new_dir
-    except Exception:
-        pass
+    raw_title = _extract_braced_arg(content, match.end() - 1)
+    if not raw_title:
+        return None
 
-    return None
+    raw_title = re.sub(r"\\\\", " ", raw_title)
+    raw_title = re.sub(r"\\[a-zA-Z]+\s*(\{[^}]*\})?", " ", raw_title)
+    raw_title = re.sub(r"[{}]", "", raw_title)
+    raw_title = re.sub(r"\s+", " ", raw_title).strip()
+    if not raw_title:
+        return None
+
+    safe_title = sanitize_filename(raw_title, max_length=40)
+    new_dir = output_dir / f"{dir_id}_{safe_title}"
+    if new_dir.exists():
+        return None
+
+    target_dir.rename(new_dir)
+    print(f"从 tex 提取标题，目录重命名为: {new_dir.name}")
+    return new_dir
 
 
 S2_API_BASE = "https://api.semanticscholar.org/graph/v1"

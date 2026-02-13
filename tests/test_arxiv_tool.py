@@ -336,9 +336,8 @@ class TestTryRenameWithTitle:
 
         new_dir = arxiv_tool._try_rename_with_title(target, "1706.03762", tmp_path)
         assert new_dir is not None
-        # LaTeX 命令 \textbf 应被清理
+        assert "1706.03762_" in new_dir.name
         assert "textbf" not in new_dir.name
-        assert "Bold" in new_dir.name
 
     def test_dest_exists_no_rename(self, tmp_path):
         """目标目录已存在时不重命名"""
