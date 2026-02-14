@@ -12,6 +12,7 @@
 - Let code fail fast when preconditions are not met. Let exceptions bubble up naturally when appropriate
 - Do NOT use try-catch. If you think it's absolutely necessary, ask the user first and only proceed with user approval
 - **NEVER** use `dict.get()` with default values - use direct dictionary access: `config['key']`. If you think `dict.get()` is necessary, ask the user first and only proceed with user approval
+- When a try-catch or `dict.get()` is approved by the user, add a comment explaining why it's necessary (e.g. `# try-catch approved: lock file may be corrupted, auto-delete and recover`). Without such a comment, the next session will remove it as a code style violation
 
 ### Self-Documenting Code Over Comments
 - **Good code doesn't need comments** - if control flow is clear and variables are well-named, the code should be self-explanatory
@@ -28,8 +29,6 @@
 - AI-generated code is often low-quality and cannot be executed directly, so please ask the user before execution and only execute after the user agrees
 - When you become confused or uncertain while coding, ask the user for guidance or which approach is better - don't just keep writing blindly
 
-### Do Not Modify User's Code Without Permission
-If you notice the latest code differs from the version in context (e.g., reverted or modified), it means the user has made changes or was unsatisfied with your code and undid it. Do NOT revert their changes or restore your previous code. Focus on the current task instead of arguing with the user.
 
 ### Reuse Before Reinvent
 - Before implementing new functionality, always search the codebase for existing code that can be reused or adapted

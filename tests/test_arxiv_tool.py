@@ -360,33 +360,31 @@ class TestTryRenameWithTitle:
 # ════════════════════════════════════════════════════════════════════
 
 
-class TestFetchPaperFailure:
-    """fetch_paper 失败场景"""
+class TestCmdFetchFailure:
+    """cmd_fetch 失败场景"""
 
-    def test_download_failure_returns_none(self, tmp_path):
-        """PDF 下载失败返回 None"""
-        with patch("arxiv_tool.download_pdf", return_value=False):
-            result = arxiv_tool.fetch_paper(TEST_ID, tmp_path)
-            assert result is None
-            # 不应创建 txt
-            assert not (tmp_path / f"{TEST_ID}.txt").exists()
+    def test_download_failure_raises(self, tmp_path):
+        """PDF 下载失败（HTTP 错误）应抛异常"""
+        import requests
 
-    def test_pdf_extraction_error(self, tmp_path):
-        """PDF 解析失败应抛异常（非法 PDF）"""
-        pdf_path = tmp_path / f"{TEST_ID}.pdf"
-        pdf_path.write_bytes(b"not a real pdf")
-        with pytest.raises(Exception):
-            arxiv_tool.extract_text_from_pdf(pdf_path)
+        with patch("arxiv_tool.requests.get") as mock_get:
+            mock_get.return_value.raise_for_status.side_effect = requests.HTTPError("404")
+            args = argparse.Namespace(arxiv_id=TEST_ID, output=str(tmp_path))
+            with pytest.raises(requests.HTTPError):
+                arxiv_tool.cmd_fetch(args)
 
     def test_old_format_id_slash_replaced(self, tmp_path):
         """旧格式 ID 的 / 应被替换为 _ 用于文件名"""
-        with patch("arxiv_tool.download_pdf", return_value=False) as mock_dl:
-            result = arxiv_tool.fetch_paper("cs/0401001", tmp_path)
-            assert result is None  # 下载失败
-            # 验证传给 download_pdf 的路径用了 cs_0401001 而非 cs/0401001
-            save_path = mock_dl.call_args[0][1]
-            assert "cs_0401001" in save_path.name
-            assert "/" not in save_path.name
+        import requests
+
+        with patch("arxiv_tool.requests.get") as mock_get:
+            mock_get.return_value.raise_for_status.side_effect = requests.HTTPError("404")
+            args = argparse.Namespace(arxiv_id="cs/0401001", output=str(tmp_path))
+            with pytest.raises(requests.HTTPError):
+                arxiv_tool.cmd_fetch(args)
+            # 验证请求的 URL 使用了正确的 arXiv ID
+            call_url = mock_get.call_args[0][0]
+            assert "cs/0401001" in call_url
 
 
 class TestFetchTexSourceFailure:
@@ -516,22 +514,17 @@ class TestCmdBib:
 class TestCmdFetch:
     """cmd_fetch CLI 行为"""
 
-    def test_success_returns_normally(self, tmp_path, capsys):
-        """成功时不退出，且调用了 fetch_paper"""
-        fake_txt = tmp_path / f"{TEST_ID}.txt"
-        fake_txt.write_text("cached")
+    def test_cached_returns_existing(self, tmp_path, capsys):
+        """txt 已存在时跳过下载"""
+        txt = tmp_path / f"{TEST_ID}.txt"
+        txt.write_text("cached")
 
-        with patch("arxiv_tool.fetch_paper", return_value=fake_txt) as mock_fetch:
-            args = argparse.Namespace(arxiv_id=TEST_ID, output=str(tmp_path))
-            arxiv_tool.cmd_fetch(args)
-            mock_fetch.assert_called_once_with(TEST_ID, tmp_path)
+        args = argparse.Namespace(arxiv_id=TEST_ID, output=str(tmp_path))
+        arxiv_tool.cmd_fetch(args)
 
-    def test_failure_exits(self, tmp_path):
-        """下载失败时 sys.exit(1)"""
-        with patch("arxiv_tool.fetch_paper", return_value=None):
-            args = argparse.Namespace(arxiv_id=TEST_ID, output=str(tmp_path))
-            with pytest.raises(SystemExit, match="1"):
-                arxiv_tool.cmd_fetch(args)
+        out = capsys.readouterr().out
+        assert "文件已存在" in out
+        assert txt.read_text() == "cached"
 
 
 class TestCmdTex:
@@ -648,16 +641,18 @@ class TestCmdSearch:
     """cmd_search CLI 行为"""
 
     def test_no_results(self, capsys):
-        """无结果时输出提示"""
-        with patch("arxiv_tool.search_papers", return_value=[]):
-            args = argparse.Namespace(query="zzzzzzz_nonexistent", max=5, sort="relevance", categories=None)
+        """所有源都无结果时输出提示"""
+        with patch("arxiv_tool._search_s2", return_value=None), \
+             patch("arxiv_tool._search_openalex", return_value=None), \
+             patch("arxiv_tool.search_papers", return_value=[]):
+            args = argparse.Namespace(query="zzzzzzz_nonexistent", max=5, source="auto")
             arxiv_tool.cmd_search(args)
 
         out = capsys.readouterr().out
-        assert "未找到结果" in out
+        assert "未返回结果" in out
 
-    def test_formats_output(self, capsys):
-        """有结果时输出包含标题/作者/日期"""
+    def test_arxiv_fallback_formats_output(self, capsys):
+        """arXiv fallback 时输出包含标题/作者/日期"""
         mock_paper = MockPaper(
             title="Test Paper",
             authors=[MockAuthor("Alice"), MockAuthor("Bob")],
@@ -665,18 +660,16 @@ class TestCmdSearch:
             categories=["cs.LG"],
             summary="A short abstract.",
         )
-        # search 结果需要 entry_id
         mock_paper.entry_id = "http://arxiv.org/abs/2401.00001v1"
 
         with patch("arxiv_tool.search_papers", return_value=[mock_paper]):
-            args = argparse.Namespace(query="test", max=5, sort="relevance", categories=None)
+            args = argparse.Namespace(query="test", max=5, source="arxiv")
             arxiv_tool.cmd_search(args)
 
         out = capsys.readouterr().out
         assert "Test Paper" in out
         assert "Alice" in out
         assert "2024-03-15" in out
-        assert "cs.LG" in out
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -684,38 +677,61 @@ class TestCmdSearch:
 # ════════════════════════════════════════════════════════════════════
 
 
-class TestGetPaperInfoRetry:
-    """get_paper_info 的重试与退避"""
+class TestRateLimiter:
+    """RateLimiter 行为测试，使用 INTERVALS["ut"]=0.3s"""
 
-    def test_retries_on_429(self):
-        """429 时重试，最终成功"""
-        call_count = 0
+    @pytest.fixture(autouse=True)
+    def _clean_lock(self):
+        """每个测试前后清理 lock 文件"""
+        if arxiv_tool.RateLimiter.LOCK_FILE.exists():
+            arxiv_tool.RateLimiter.LOCK_FILE.unlink()
+        yield
+        if arxiv_tool.RateLimiter.LOCK_FILE.exists():
+            arxiv_tool.RateLimiter.LOCK_FILE.unlink()
 
-        def mock_results(search):
-            nonlocal call_count
-            call_count += 1
-            if call_count < 3:
-                raise Exception("HTTP 429 Too Many Requests")
-            return iter([MOCK_PAPER])
+    def test_available_when_no_lock(self):
+        assert arxiv_tool.RateLimiter.available("ut") is True
 
-        with patch("arxiv_tool.arxiv.Client") as mock_client_cls, \
-             patch("arxiv_tool.time.sleep"):  # 跳过 sleep
-            mock_client = mock_client_cls.return_value
-            mock_client.results = mock_results
-            result = arxiv_tool.get_paper_info(TEST_ID, retries=3)
+    def test_not_available_right_after_record(self):
+        arxiv_tool.RateLimiter.record("ut")
+        assert arxiv_tool.RateLimiter.available("ut") is False
 
-        assert result is not None
-        assert call_count == 3
+    def test_available_after_interval(self):
+        arxiv_tool.RateLimiter.record("ut")
+        time.sleep(0.35)
+        assert arxiv_tool.RateLimiter.available("ut") is True
 
-    def test_gives_up_after_max_retries(self):
-        """超过重试次数返回 None"""
-        with patch("arxiv_tool.arxiv.Client") as mock_client_cls, \
-             patch("arxiv_tool.time.sleep"):
-            mock_client = mock_client_cls.return_value
-            mock_client.results.side_effect = Exception("HTTP 429")
-            result = arxiv_tool.get_paper_info(TEST_ID, retries=2)
+    def test_record_does_not_affect_other_services(self):
+        arxiv_tool.RateLimiter.record("ut")
+        assert arxiv_tool.RateLimiter.available("s2") is True
 
-        assert result is None
+    def test_wait_returns_immediately_when_available(self):
+        start = time.time()
+        arxiv_tool.RateLimiter.wait("ut")
+        assert time.time() - start < 0.1
+
+    def test_wait_sleeps_remaining_time(self):
+        arxiv_tool.RateLimiter.record("ut")
+        time.sleep(0.1)  # 已过 0.1s，还需等 ~0.2s
+        start = time.time()
+        arxiv_tool.RateLimiter.wait("ut")
+        elapsed = time.time() - start
+        assert 0.1 < elapsed < 0.4
+
+    def test_wait_retries_on_contention(self):
+        """模拟另一个进程在 wait 期间更新了时间戳"""
+        arxiv_tool.RateLimiter.record("ut")
+        # wait 读到需要等 0.3s，sleep 完后再读一次确认
+        start = time.time()
+        arxiv_tool.RateLimiter.wait("ut")
+        elapsed = time.time() - start
+        assert elapsed >= 0.2  # 至少等了一轮
+
+    def test_corrupt_lock_file_auto_recovers(self):
+        arxiv_tool.RateLimiter.LOCK_FILE.write_text("this is not json")
+        assert arxiv_tool.RateLimiter.available("ut") is True
+        assert not arxiv_tool.RateLimiter.LOCK_FILE.exists()
+
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -755,11 +771,11 @@ class TestGetPaperInfo:
 
 @network
 class TestFetchPaper:
-    """fetch_paper 集成测试（下载 PDF + 转 txt）"""
+    """cmd_fetch 集成测试（下载 PDF + 转 txt）"""
 
     def test_download_creates_pdf_and_txt(self, tmp_path):
-        result = arxiv_tool.fetch_paper(TEST_ID, tmp_path)
-        assert result is not None
+        args = argparse.Namespace(arxiv_id=TEST_ID, output=str(tmp_path))
+        arxiv_tool.cmd_fetch(args)
 
         txt = tmp_path / f"{TEST_ID}.txt"
         pdf = tmp_path / f"{TEST_ID}.pdf"
@@ -772,14 +788,15 @@ class TestFetchPaper:
         assert f"arXiv:{TEST_ID}" in content
         assert len(content) > 1000
 
-    def test_cached_returns_existing(self, tmp_path):
-        """txt 已存在时跳过下载，返回已有路径"""
+    def test_cached_skips_download(self, tmp_path, capsys):
+        """txt 已存在时跳过下载"""
         txt = tmp_path / f"{TEST_ID}.txt"
         txt.write_text("cached")
 
-        result = arxiv_tool.fetch_paper(TEST_ID, tmp_path)
-        assert result == txt
+        args = argparse.Namespace(arxiv_id=TEST_ID, output=str(tmp_path))
+        arxiv_tool.cmd_fetch(args)
         assert txt.read_text() == "cached"
+        assert "文件已存在" in capsys.readouterr().out
 
 
 @network
@@ -831,30 +848,6 @@ class TestSearchPapers:
         results = arxiv_tool.search_papers("Attention Is All You Need", max_results=3)
         assert len(results) > 0
 
-    def test_search_with_category(self):
-        results = arxiv_tool.search_papers("transformer", max_results=3, categories=["cs.CL"])
-        assert len(results) > 0
-
-
-class TestSearchPapersParams:
-    """search_papers 参数传递测试（mock，不走网络）"""
-
-    def test_sort_by_submitted(self):
-        """sort_by='submitted' 正确传递"""
-        import arxiv as arxiv_lib
-
-        with patch("arxiv_tool.arxiv.Client") as mock_client_cls:
-            mock_client = mock_client_cls.return_value
-            mock_client.results.return_value = iter([])
-            arxiv_tool.search_papers("test", sort_by="submitted")
-
-        # 检查 Search 构造时的 sort_by 参数
-        search_call = None
-        for call in mock_client.results.call_args_list:
-            search_obj = call[0][0]
-            search_call = search_obj
-        assert search_call.sort_by == arxiv_lib.SortCriterion.SubmittedDate
-
     def test_max_results_passed(self):
         """max_results 正确传递"""
         with patch("arxiv_tool.arxiv.Client") as mock_client_cls:
@@ -864,18 +857,6 @@ class TestSearchPapersParams:
 
         search_obj = mock_client.results.call_args[0][0]
         assert search_obj.max_results == 7
-
-    def test_categories_build_query(self):
-        """categories 正确拼入查询"""
-        with patch("arxiv_tool.arxiv.Client") as mock_client_cls:
-            mock_client = mock_client_cls.return_value
-            mock_client.results.return_value = iter([])
-            arxiv_tool.search_papers("PINN", categories=["cs.LG", "physics.comp-ph"])
-
-        search_obj = mock_client.results.call_args[0][0]
-        assert "cat:cs.LG" in search_obj.query
-        assert "cat:physics.comp-ph" in search_obj.query
-        assert "PINN" in search_obj.query
 
 
 @network

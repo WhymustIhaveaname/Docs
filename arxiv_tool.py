@@ -3,6 +3,7 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #     "arxiv",
+#     "json5",
 #     "pymupdf",
 #     "python-dotenv",
 #     "requests",
@@ -46,6 +47,7 @@ from typing import TYPE_CHECKING
 
 import arxiv
 import fitz  # PyMuPDF
+import json5
 import requests
 from dotenv import load_dotenv
 
@@ -59,48 +61,86 @@ load_dotenv(SCRIPT_DIR / ".env", override=False)
 # API Keys（有就用，没有也不影响基本功能）
 S2_API_KEY: str | None = os.environ.get("S2_API_KEY")
 OPENALEX_API_KEY: str | None = os.environ.get("OPENALEX_API_KEY")
+CONTACT_EMAIL: str = os.environ.get("CONTACT_EMAIL", "")
+
+# API 基础 URL
+S2_API_BASE = "https://api.semanticscholar.org/graph/v1"
+OPENALEX_API_BASE = "https://api.openalex.org"
 
 # HTTP 请求头（arXiv 推荐设置 User-Agent）
+_mailto = f" (mailto:{CONTACT_EMAIL})" if CONTACT_EMAIL else ""
 HTTP_HEADERS = {
-    "User-Agent": "arxiv-tool/1.0 (mailto:syouran0508@gmail.com)",
+    "User-Agent": f"arxiv-tool/1.0{_mailto}",
 }
 
 OUTPUT_DIR = SCRIPT_DIR / "arxiv"
 
 
-def get_paper_info(arxiv_id: str, retries: int = 3) -> Result | None:
-    """获取论文元数据，带重试和退避
+class RateLimiter:
+    """跨进程 rate limit 管理，用 json5 lock 文件实现"""
 
-    Args:
-        arxiv_id: 清理后的 arXiv ID
-        retries: 最大重试次数
+    LOCK_FILE = SCRIPT_DIR / ".ratelimit.lock"
+    INTERVALS = {
+        "s2": 2.0,  # Semantic Scholar: 1 req/s，用 2s 间隔留余量
+        "arxiv": 3.0,  # arXiv 官方 API，限流严格
+        "ut": 0.3,  # 测试用
+    }
 
-    Returns:
-        论文结果，失败返回 None（不抛异常）
-    """
-    clean_id = extract_arxiv_id(arxiv_id)
-    for attempt in range(retries):
+    @classmethod
+    def _read(cls) -> dict:
+        if not cls.LOCK_FILE.exists():
+            return {}
+        # try-catch approved: lock 文件可能损坏，自动删除并恢复，不应阻断功能
         try:
-            client = arxiv.Client()
-            search = arxiv.Search(id_list=[clean_id])
-            results = list(client.results(search))
-            if results:
-                return results[0]
-            print(f"未找到论文: {clean_id}", file=sys.stderr)
-            return None
-        except Exception as e:
-            err_str = str(e)
-            is_429 = "429" in err_str
-            if is_429 and attempt < retries - 1:
-                wait = 3 * (attempt + 1)
-                print(f"API 限流 (429)，{wait}s 后重试 ({attempt + 1}/{retries})...", file=sys.stderr)
-                time.sleep(wait)
-            elif attempt < retries - 1:
-                wait = 2 * (attempt + 1)
-                print(f"API 请求失败: {e}，{wait}s 后重试 ({attempt + 1}/{retries})...", file=sys.stderr)
-                time.sleep(wait)
-            else:
-                print(f"API 请求失败（已重试 {retries} 次）: {e}", file=sys.stderr)
+            return json5.loads(cls.LOCK_FILE.read_text())
+        except ValueError:
+            cls.LOCK_FILE.unlink(missing_ok=True)
+            return {}
+
+    @classmethod
+    def _write(cls, lock: dict) -> None:
+        cls.LOCK_FILE.write_text(json5.dumps(lock))
+
+    @classmethod
+    def available(cls, service: str) -> bool:
+        lock = cls._read()
+        if service not in lock:
+            return True
+        return time.time() - lock[service] >= cls.INTERVALS[service]
+
+    @classmethod
+    def wait(cls, service: str) -> None:
+        interval = cls.INTERVALS[service]
+        for _ in range(5):
+            lock = cls._read()
+            if service not in lock:
+                break
+            remaining = interval - (time.time() - lock[service])
+            if remaining <= 0:
+                break
+            time.sleep(remaining)
+        else:
+            raise RuntimeError(
+                f"RateLimiter: {service} 连续 5 次未能获得请求窗口，请检查"
+            )
+
+    @classmethod
+    def record(cls, service: str) -> None:
+        lock = cls._read()
+        lock[service] = time.time()
+        cls._write(lock)
+
+
+def get_paper_info(arxiv_id: str) -> Result | None:
+    clean_id = extract_arxiv_id(arxiv_id)
+    RateLimiter.wait("arxiv")
+    client = arxiv.Client()
+    search = arxiv.Search(id_list=[clean_id])
+    results = list(client.results(search))
+    RateLimiter.record("arxiv")
+    if results:
+        return results[0]
+    print(f"未找到论文: {clean_id}", file=sys.stderr)
     return None
 
 
@@ -133,143 +173,172 @@ def extract_arxiv_id(input_str: str) -> str:
     return input_str
 
 
-def extract_text_from_pdf(pdf_path: Path) -> str:
-    doc = fitz.open(pdf_path)
-    text_parts = []
-    for page in doc:
-        text_parts.append(page.get_text().strip())
-    doc.close()
-    return "\n".join(text_parts)
-
-
-def download_pdf(url: str, save_path: Path) -> bool:
-    try:
-        response = requests.get(url, headers=HTTP_HEADERS, timeout=60)
-        response.raise_for_status()
-        save_path.write_bytes(response.content)
-        return True
-    except requests.RequestException as e:
-        print(f"下载失败: {e}", file=sys.stderr)
-        return False
-
-
-def search_papers(
-    query: str,
-    max_results: int = 10,
-    sort_by: str = "relevance",
-    categories: list[str] | None = None,
-) -> list[Result]:
-    """搜索 arXiv 论文
-
-    Args:
-        query: 搜索关键词
-        max_results: 最大结果数
-        sort_by: 排序方式 (relevance, submitted, updated)
-        categories: arXiv 分类列表，如 ["cs.AI", "cs.LG"]
-    """
-    search_query = query
-    if categories:
-        cat_query = " OR ".join(f"cat:{cat}" for cat in categories)
-        search_query = f"({query}) AND ({cat_query})"
-
-    sort_map = {
-        "relevance": arxiv.SortCriterion.Relevance,
-        "submitted": arxiv.SortCriterion.SubmittedDate,
-        "updated": arxiv.SortCriterion.LastUpdatedDate,
-    }
-    sort_criterion = sort_map[sort_by]
-
+def search_papers(query: str, max_results: int = 20) -> list[Result]:
     client = arxiv.Client()
-    search = arxiv.Search(
-        query=search_query,
-        max_results=max_results,
-        sort_by=sort_criterion,
-    )
-
+    search = arxiv.Search(query=query, max_results=max_results)
     return list(client.results(search))
 
 
-def fetch_paper(arxiv_id: str, output_dir: Path) -> Path | None:
-    """获取论文全文并保存为 txt
+def _normalize_s2_search(results: list[dict]) -> list[dict]:
+    out = []
+    for paper in results:
+        ext_ids = paper["externalIds"] or {}
+        arxiv_id = ext_ids["ArXiv"] if "ArXiv" in ext_ids else ""
+        doi = ext_ids["DOI"] if "DOI" in ext_ids else ""
+        id_str = (f"arXiv:{arxiv_id}" if arxiv_id else "") or (
+            f"DOI:{doi}" if doi else ""
+        )
 
-    不调用 API，直接下载 PDF 并转换。文件名使用 arXiv ID。
+        authors = paper["authors"] or []
+        author_str = ", ".join(a["name"] for a in authors[:3])
+        if len(authors) > 3:
+            author_str += "..."
 
-    Args:
-        arxiv_id: arXiv ID
-        output_dir: 输出目录
+        out.append(
+            {
+                "id": id_str,
+                "title": paper["title"],
+                "authors": author_str,
+                "year": str(paper["year"] or "?"),
+                "cited_by": paper["citationCount"],
+                "abstract": paper["abstract"],
+            }
+        )
+    return out
 
-    Returns:
-        保存的文件路径，失败返回 None
-    """
+
+def _normalize_openalex_search(results: list[dict]) -> list[dict]:
+    out = []
+    for work in results:
+        authorships = work["authorships"] or []
+        author_str = ", ".join(a["author"]["display_name"] for a in authorships[:3])
+        if len(authorships) > 3:
+            author_str += "..."
+
+        ids = work["ids"] or {}
+        arxiv_str = ""
+        for key, val in ids.items():
+            if "arxiv" in key.lower() and val:
+                arxiv_str = val.replace("https://arxiv.org/abs/", "arXiv:")
+                break
+        doi = ids["doi"] if "doi" in ids else ""
+        openalex_id = ids["openalex"] if "openalex" in ids else ""
+        id_str = arxiv_str or doi or openalex_id
+
+        out.append(
+            {
+                "id": id_str,
+                "title": work["title"],
+                "authors": author_str,
+                "year": str(work["publication_year"] or "?"),
+                "cited_by": work["cited_by_count"],
+                "abstract": None,
+            }
+        )
+    return out
+
+
+def _normalize_arxiv_search(results: list) -> list[dict]:
+    out = []
+    for paper in results:
+        arxiv_id = paper.entry_id.split("/abs/")[-1]
+        author_str = ", ".join(a.name for a in paper.authors[:3])
+        if len(paper.authors) > 3:
+            author_str += "..."
+
+        out.append(
+            {
+                "id": f"arXiv:{arxiv_id}",
+                "title": paper.title,
+                "authors": author_str,
+                "year": paper.published.strftime("%Y-%m-%d"),
+                "cited_by": None,
+                "abstract": paper.summary,
+            }
+        )
+    return out
+
+
+def _print_search_results(results: list[dict]) -> None:
+    for i, r in enumerate(results, 1):
+        print(f"[{i}] {r['id']}")
+        print(f"    标题: {r['title']}")
+        print(f"    作者: {r['authors']}")
+        cited = f"  被引: {r['cited_by']}" if r["cited_by"] is not None else ""
+        print(f"    年份: {r['year']}{cited}")
+        if r["abstract"]:
+            print(f"    摘要: {r['abstract'].replace(chr(10), ' ')}")
+        print()
+
+
+def cmd_search(args):
+    source = args.source
+
+    results = None
+
+    if source in ("s2", "auto") and RateLimiter.available("s2"):
+        print("搜索 Semantic Scholar...", file=sys.stderr)
+        raw = _search_s2(args.query, args.max)
+        if raw:
+            results = ("Semantic Scholar", _normalize_s2_search(raw))
+
+    if not results and source in ("openalex", "auto"):
+        print("搜索 OpenAlex...", file=sys.stderr)
+        raw = _search_openalex(args.query, args.max)
+        if raw:
+            results = ("OpenAlex", _normalize_openalex_search(raw))
+
+    if not results and source in ("arxiv", "auto"):
+        if source == "auto":
+            print(
+                "⚠ Semantic Scholar 和 OpenAlex 均失败，fallback 到 arXiv API。"
+                "如果此消息持续出现，请检查 API key 和网络连接。",
+                file=sys.stderr,
+            )
+        print("搜索 arXiv...", file=sys.stderr)
+        raw = search_papers(args.query, args.max)
+        if raw:
+            results = ("arXiv", _normalize_arxiv_search(raw))
+
+    if not results:
+        print("所有搜索源均未返回结果")
+        return
+
+    source_name, normalized = results
+    print(f"\n找到 {len(normalized)} 篇论文 ({source_name}):\n")
+    _print_search_results(normalized)
+
+
+def cmd_fetch(args):
+    output_dir = Path(args.output) if args.output else OUTPUT_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    clean_id = extract_arxiv_id(arxiv_id)
+    clean_id = extract_arxiv_id(args.arxiv_id)
     file_id = clean_id.replace("/", "_")
     txt_file = output_dir / f"{file_id}.txt"
     pdf_file = output_dir / f"{file_id}.pdf"
 
     if txt_file.exists():
         print(f"文件已存在: {txt_file}")
-        return txt_file
+        return
 
     pdf_url = f"https://arxiv.org/pdf/{clean_id}"
     print(f"下载 PDF: {pdf_url}")
-
-    if not download_pdf(pdf_url, pdf_file):
-        return None
+    response = requests.get(pdf_url, headers=HTTP_HEADERS, timeout=60)
+    response.raise_for_status()
+    pdf_file.write_bytes(response.content)
 
     print("提取文本...")
-    text = extract_text_from_pdf(pdf_file)
+    doc = fitz.open(pdf_file)
+    text = "\n".join(page.get_text().strip() for page in doc)
+    doc.close()
 
-    header = f"""\
-# arXiv:{clean_id}
-
-URL: https://arxiv.org/abs/{clean_id}
-
-## Full Text
-
-"""
-
-    txt_file.write_text(header + text, encoding="utf-8")
+    txt_file.write_text(
+        f"# arXiv:{clean_id}\n\nURL: https://arxiv.org/abs/{clean_id}\n\n## Full Text\n\n{text}",
+        encoding="utf-8",
+    )
     print(f"已保存 PDF: {pdf_file}")
     print(f"已保存 TXT: {txt_file}")
-    return txt_file
-
-
-def cmd_search(args):
-    categories = args.categories.split(",") if args.categories else None
-
-    results = search_papers(
-        query=args.query,
-        max_results=args.max,
-        sort_by=args.sort,
-        categories=categories,
-    )
-
-    if not results:
-        print("未找到结果")
-        return
-
-    print(f"\n找到 {len(results)} 篇论文:\n")
-
-    for i, paper in enumerate(results, 1):
-        arxiv_id = paper.entry_id.split("/abs/")[-1]
-
-        print(f"[{i}] {arxiv_id}")
-        print(f"    标题: {paper.title}")
-        print(f"    作者: {', '.join(a.name for a in paper.authors[:3])}{'...' if len(paper.authors) > 3 else ''}")
-        print(f"    日期: {paper.published.strftime('%Y-%m-%d')}")
-        print(f"    分类: {', '.join(paper.categories[:3])}")
-
-        print(f"    摘要: {paper.summary.replace(chr(10), ' ')}")
-        print()
-
-
-def cmd_fetch(args):
-    output_dir = Path(args.output) if args.output else OUTPUT_DIR
-    result = fetch_paper(args.arxiv_id, output_dir)
-    if not result:
-        sys.exit(1)
 
 
 def cmd_info(args):
@@ -291,11 +360,52 @@ def cmd_info(args):
 
 # 停用词列表，用于生成 citation key
 STOPWORDS = {
-    "a", "an", "the", "of", "for", "and", "or", "in", "on", "at", "to", "with",
-    "by", "from", "as", "is", "are", "was", "were", "be", "been", "being",
-    "have", "has", "had", "do", "does", "did", "will", "would", "could", "should",
-    "may", "might", "must", "shall", "can", "need", "dare", "ought", "used",
-    "via", "using", "based", "towards", "toward",
+    "a",
+    "an",
+    "the",
+    "of",
+    "for",
+    "and",
+    "or",
+    "in",
+    "on",
+    "at",
+    "to",
+    "with",
+    "by",
+    "from",
+    "as",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "have",
+    "has",
+    "had",
+    "do",
+    "does",
+    "did",
+    "will",
+    "would",
+    "could",
+    "should",
+    "may",
+    "might",
+    "must",
+    "shall",
+    "can",
+    "need",
+    "dare",
+    "ought",
+    "used",
+    "via",
+    "using",
+    "based",
+    "towards",
+    "toward",
 }
 
 
@@ -358,7 +468,9 @@ def cmd_bib(args):
         print(bibtex)
 
 
-def print_tree(directory: Path, prefix: str = "", max_depth: int = 3, current_depth: int = 0) -> list[str]:
+def print_tree(
+    directory: Path, prefix: str = "", max_depth: int = 3, current_depth: int = 0
+) -> list[str]:
     lines = []
     if current_depth >= max_depth:
         return lines
@@ -371,7 +483,9 @@ def print_tree(directory: Path, prefix: str = "", max_depth: int = 3, current_de
 
         if item.is_dir():
             extension = "    " if is_last else "│   "
-            lines.extend(print_tree(item, prefix + extension, max_depth, current_depth + 1))
+            lines.extend(
+                print_tree(item, prefix + extension, max_depth, current_depth + 1)
+            )
 
     return lines
 
@@ -497,7 +611,9 @@ def _strip_tex_comments(content: str) -> str:
     return "\n".join(result)
 
 
-def _try_rename_with_title(target_dir: Path, dir_id: str, output_dir: Path) -> Path | None:
+def _try_rename_with_title(
+    target_dir: Path, dir_id: str, output_dir: Path
+) -> Path | None:
     tex_files = list(target_dir.glob("*.tex"))
     if not tex_files:
         return None
@@ -531,11 +647,6 @@ def _try_rename_with_title(target_dir: Path, dir_id: str, output_dir: Path) -> P
     return new_dir
 
 
-S2_API_BASE = "https://api.semanticscholar.org/graph/v1"
-OPENALEX_API_BASE = "https://api.openalex.org"
-CONTACT_EMAIL = "syouran0508@gmail.com"
-
-
 def _s2_headers() -> dict[str, str]:
     headers = dict(HTTP_HEADERS)
     if S2_API_KEY:
@@ -543,12 +654,76 @@ def _s2_headers() -> dict[str, str]:
     return headers
 
 
-def _fetch_citations_s2(arxiv_id: str, max_results: int, offset: int = 0) -> tuple[list[dict], int] | None:
+def _search_s2(query: str, max_results: int = 10) -> list[dict] | None:
+    """通过 Semantic Scholar 搜索论文
+
+    Returns:
+        论文列表 [{"title", "year", "authors", "externalIds", "citationCount", "abstract"}]，
+        失败返回 None（含 rate limit 不可用）
+    """
+    url = f"{S2_API_BASE}/paper/search"
+    try:
+        resp = requests.get(
+            url,
+            params={
+                "query": query,
+                "limit": min(max_results, 100),
+                "fields": "title,year,authors,externalIds,citationCount,abstract",
+            },
+            headers=_s2_headers(),
+            timeout=30,
+        )
+        RateLimiter.record("s2")
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as e:
+        print(f"Semantic Scholar 搜索失败: {e}", file=sys.stderr)
+        return None
+
+    if not data.get("data"):
+        return None
+    return data["data"][:max_results]
+
+
+def _search_openalex(query: str, max_results: int = 10) -> list[dict] | None:
+    """通过 OpenAlex 搜索论文
+
+    Returns:
+        论文列表 [{"title", "publication_year", "authorships", "cited_by_count", "ids", ...}]，
+        失败返回 None
+    """
+    url = f"{OPENALEX_API_BASE}/works"
+    try:
+        resp = requests.get(
+            url,
+            params=_openalex_params(
+                search=query,
+                select="id,title,authorships,publication_year,cited_by_count,ids",
+                per_page=str(min(max_results, 200)),
+                sort="relevance_score:desc",
+            ),
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as e:
+        print(f"OpenAlex 搜索失败: {e}", file=sys.stderr)
+        return None
+
+    if not data.get("results"):
+        return None
+    return data["results"][:max_results]
+
+
+def _fetch_citations_s2(
+    arxiv_id: str, max_results: int, offset: int = 0
+) -> tuple[list[dict], int] | None:
     """从 Semantic Scholar 获取引用该论文的论文列表
 
     Returns:
         (引用论文列表, 总被引次数)，失败返回 None
     """
+    RateLimiter.wait("s2")
     info_url = f"{S2_API_BASE}/paper/ArXiv:{arxiv_id}"
     try:
         resp = requests.get(
@@ -565,6 +740,7 @@ def _fetch_citations_s2(arxiv_id: str, max_results: int, offset: int = 0) -> tup
         print(f"Semantic Scholar 查询失败: {e}", file=sys.stderr)
         return None
 
+    RateLimiter.wait("s2")
     citations_url = f"{S2_API_BASE}/paper/ArXiv:{arxiv_id}/citations"
     try:
         resp = requests.get(
@@ -583,7 +759,9 @@ def _fetch_citations_s2(arxiv_id: str, max_results: int, offset: int = 0) -> tup
         print(f"Semantic Scholar 引用列表获取失败: {e}", file=sys.stderr)
         return None
 
-    results = [item["citingPaper"] for item in data["data"] if item["citingPaper"]["title"]]
+    results = [
+        item["citingPaper"] for item in data["data"] if item["citingPaper"]["title"]
+    ]
     return results[:max_results], paper_info["citationCount"]
 
 
@@ -614,7 +792,9 @@ def _resolve_openalex_id(arxiv_id: str) -> tuple[str, str, int] | None:
         return None
 
 
-def _fetch_citations_openalex(arxiv_id: str, max_results: int, offset: int = 0) -> tuple[list[dict], int] | None:
+def _fetch_citations_openalex(
+    arxiv_id: str, max_results: int, offset: int = 0
+) -> tuple[list[dict], int] | None:
     """从 OpenAlex 获取引用该论文的论文列表
 
     Returns:
@@ -668,7 +848,9 @@ def _print_citations_s2(results: list[dict], start: int = 1) -> None:
 
         print(f"[{i}] {paper['title']}")
         print(f"    作者: {author_str}")
-        print(f"    年份: {paper['year'] or '?'}  被引: {paper['citationCount']}{arxiv_str}")
+        print(
+            f"    年份: {paper['year'] or '?'}  被引: {paper['citationCount']}{arxiv_str}"
+        )
         print()
 
 
@@ -681,7 +863,9 @@ def _print_citations_openalex(results: list[dict], start: int = 1) -> None:
 
         print(f"[{i}] {work['title']}")
         print(f"    作者: {author_str}")
-        print(f"    年份: {work['publication_year'] or '?'}  被引: {work['cited_by_count']}")
+        print(
+            f"    年份: {work['publication_year'] or '?'}  被引: {work['cited_by_count']}"
+        )
         print()
 
 
@@ -744,7 +928,6 @@ def main():
         epilog="""\
 示例:
     %(prog)s search "PINN" --max 5
-    %(prog)s search "physics-informed" --categories cs.LG,physics.comp-ph
     %(prog)s fetch 2401.12345
     %(prog)s fetch 2401.12345 --output ./papers
     %(prog)s info 2401.12345
@@ -761,16 +944,17 @@ def main():
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # search 子命令
-    search_parser = subparsers.add_parser("search", help="搜索论文")
+    search_parser = subparsers.add_parser("search", help="搜索论文 (S2→OpenAlex→arXiv)")
     search_parser.add_argument("query", help="搜索关键词")
-    search_parser.add_argument("--max", type=int, default=10, help="最大结果数 (默认 10)")
     search_parser.add_argument(
-        "--sort",
-        choices=["relevance", "submitted", "updated"],
-        default="relevance",
-        help="排序方式 (默认 relevance)",
+        "--max", type=int, default=20, help="最大结果数 (默认 20)"
     )
-    search_parser.add_argument("--categories", help="arXiv 分类，逗号分隔 (如 cs.AI,cs.LG)")
+    search_parser.add_argument(
+        "--source",
+        choices=["auto", "s2", "openalex", "arxiv"],
+        default="auto",
+        help="数据源: auto=自动(S2→OpenAlex→arXiv), s2, openalex, arxiv (默认 auto)",
+    )
     search_parser.set_defaults(func=cmd_search)
 
     # fetch 子命令
@@ -793,8 +977,12 @@ def main():
     # cited 子命令
     cited_parser = subparsers.add_parser("cited", help="被引反查：查看哪些论文引用了它")
     cited_parser.add_argument("arxiv_id", help="arXiv ID")
-    cited_parser.add_argument("--max", type=int, default=20, help="最大显示条数 (默认 20)")
-    cited_parser.add_argument("--offset", type=int, default=0, help="跳过前 N 条结果，用于翻页 (默认 0)")
+    cited_parser.add_argument(
+        "--max", type=int, default=20, help="最大显示条数 (默认 20)"
+    )
+    cited_parser.add_argument(
+        "--offset", type=int, default=0, help="跳过前 N 条结果，用于翻页 (默认 0)"
+    )
     cited_parser.add_argument(
         "--source",
         choices=["auto", "s2", "openalex"],

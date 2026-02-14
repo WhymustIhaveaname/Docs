@@ -31,16 +31,19 @@ uv run /home/prime/Codes/Docs/arxiv_tool.py <子命令>
 
 ### 搜索论文
 
+搜索默认走 **Semantic Scholar → OpenAlex → arXiv** 三级 fallback。S2 搜索质量最高；OpenAlex 覆盖最广；arXiv 作为最后兜底。
+
 ```bash
-uv run /home/prime/Codes/Docs/arxiv_tool.py search "关键词" --max 10
-uv run /home/prime/Codes/Docs/arxiv_tool.py search "PINN" --categories cs.LG,physics.comp-ph
-uv run /home/prime/Codes/Docs/arxiv_tool.py search "neural network" --sort relevance
+uv run /home/prime/Codes/Docs/arxiv_tool.py search "关键词"
+uv run /home/prime/Codes/Docs/arxiv_tool.py search "neural network" --max 10
+uv run /home/prime/Codes/Docs/arxiv_tool.py search "neural network" --source s2        # 强制用 Semantic Scholar
+uv run /home/prime/Codes/Docs/arxiv_tool.py search "neural network" --source openalex  # 强制用 OpenAlex
+uv run /home/prime/Codes/Docs/arxiv_tool.py search "neural network" --source arxiv     # 强制用 arXiv
 ```
 
 参数：
-- `--max`: 结果数量，默认 10
-- `--sort`: 排序方式 (relevance, submitted, updated)
-- `--categories`: 分类过滤，逗号分隔
+- `--max`: 结果数量，默认 20
+- `--source`: 数据源 (auto, s2, openalex, arxiv)，默认 auto
 
 ### 获取论文全文
 
@@ -119,6 +122,8 @@ uv run /home/prime/Codes/Docs/arxiv_tool.py cited 1711.10561 --source s2        
 
 ## 最佳实践
 
+尽可能使用 `tex` 而不是 `fetch`——两者对 arXiv 服务器的压力差不多，但 `tex` 拿到的是原生 LaTeX 源码，绝对不会乱；`fetch` 依赖 PDF 转文本，排版复杂时容易丢信息或错位。
+
 | 场景 | 命令 |
 |------|------|
 | 已知 arXiv ID，需要全文（纯文本） | `arxiv_tool.py fetch <ID>` |
@@ -136,11 +141,26 @@ uv run /home/prime/Codes/Docs/arxiv_tool.py cited 1711.10561 --source s2        
 API Key 存放在 `Docs/.env`（已 gitignore），脚本启动时自动加载：
 
 ```
-S2_API_KEY=xxx         # Semantic Scholar（被引反查用）
-OPENALEX_API_KEY=xxx   # OpenAlex（被引反查备选）
+S2_API_KEY=xxx         # Semantic Scholar（搜索 + 被引反查）
+OPENALEX_API_KEY=xxx   # OpenAlex（搜索 + 被引反查备选）
+CONTACT_EMAIL=xxx      # 用于 HTTP User-Agent 和 OpenAlex polite pool
 ```
 
-有 key 就用，没有也不影响基本功能（search/fetch/info/bib/tex 不需要 key）。
+**S2_API_KEY 和 OPENALEX_API_KEY 强烈建议配置**：search 和 cited 命令依赖这两个服务。无 key 时 rate limit 极低（S2: 100 请求/5 分钟；OpenAlex: 100 credits/天），有 key 后大幅提升（S2: 1 请求/秒；OpenAlex: 10 万 credits/天）。
+
+## Rate Limit 与故障排查
+
+脚本通过 `.ratelimit.lock` 文件（`RateLimiter` 类）自动管理所有 API 的请求间隔：
+
+- **Semantic Scholar**：有 key 时 1 请求/秒，脚本默认间隔 2 秒
+- **arXiv**：官方 API 限流严格，脚本默认间隔 3 秒
+- **OpenAlex**：有 key 时 10 万 credits/天，无需额外限流
+
+**如果 search 命令持续输出 "Semantic Scholar 和 OpenAlex 均失败" 警告**：
+1. 检查 `.env` 中 API key 是否正确
+2. 检查网络连接（`curl -s https://api.semanticscholar.org/graph/v1/paper/search?query=test`）
+3. 如果 S2 返回 429，可增大 `RateLimiter.INTERVALS["s2"]`
+4. 此警告**不应该持续出现**——如果连续多次 fallback 到 arXiv，一定有配置问题需要排查
 
 ## 输出目录
 
